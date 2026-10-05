@@ -39,6 +39,12 @@ AIKitStreamResponse::~AIKitStreamResponse() {
 }
 
 void AIKitStreamResponse::beginRequest(AIKitClient* owner) {
+    // 先释放可能的残留槽位（对象复用场景）
+#if defined(ESP32)
+    for (size_t i = 0; i < kRingSlots; i++) {
+        if (_ring[i] != nullptr) { delete _ring[i]; _ring[i] = nullptr; }
+    }
+#endif
     AIKIT_SR_ENTER();
     _owner = owner;
     _head = 0; _tail = 0; _count = 0; _bytes_buffered = 0;
@@ -49,8 +55,9 @@ void AIKitStreamResponse::beginRequest(AIKitClient* owner) {
     _err = AIKIT_OK;
     _closed = false;
     _cur = ""; _cur_pos = 0; _cur_valid = false;
-    // 清空槽位残留（复用对象时）
+#if !defined(ESP32)
     for (size_t i = 0; i < kRingSlots; i++) _ring[i] = String();
+#endif
     AIKIT_SR_EXIT();
 }
 
@@ -58,26 +65,36 @@ bool AIKitStreamResponse::pushLineBlocking(const String& line) {
     if (_closed) return true;   // 消费者已提前关闭：静默丢弃，避免误报溢出
 
 #if defined(ESP32)
-    // 生产者运行在 StreamHTTPClient 的后台任务中；缓冲满时节流等待，
-    // 由消费者读取形成背压。超时则置溢出错误并放弃该行（不崩溃）。
+    // 生产者运行在 StreamHTTPClient 的后台任务中。
+    // 堆分配在锁外完成；缓冲满时节流等待，由消费者读取形成背压。
+    // 超时则置溢出错误并放弃该行（不崩溃）。
+    String* p = new (std::nothrow) String(line);
+    if (p == nullptr) {
+        setError(AIKIT_ERR_OOM);
+        return false;
+    }
     uint32_t t0 = millis();
     while (true) {
+        bool stored = false;
         AIKIT_SR_ENTER();
         if (_count < kRingSlots) {
-            _ring[_head] = line;
+            _ring[_head] = p;
             _head = (_head + 1) % kRingSlots;
             ++_count;
-            _bytes_buffered += line.length() + 1;
-            AIKIT_SR_EXIT();
-            return true;
+            _bytes_buffered += p->length() + 1;
+            stored = true;
         }
         AIKIT_SR_EXIT();
+        if (stored) return true;
+
         if (_completed && _count >= kRingSlots) {
             // 消费者已放弃且请求仍在收尾：不再等待
+            delete p;
             setError(AIKIT_ERR_BUFFER_OVERFLOW);
             return false;
         }
         if (millis() - t0 >= (uint32_t)AIKIT_LINE_PUSH_TIMEOUT_MS) {
+            delete p;
             setError(AIKIT_ERR_BUFFER_OVERFLOW);
             return false;
         }
@@ -86,7 +103,6 @@ bool AIKitStreamResponse::pushLineBlocking(const String& line) {
 #else
     // 单上下文平台：请求已在 chatStreamTo() 内执行完毕后才会被读取，
     // 无法形成背压，因此用「行数 + 字节」双重上限防止长回复耗尽内存。
-    AIKIT_SR_ENTER();
     bool over = (_count >= kRingSlots) ||
                 (_bytes_buffered + line.length() + 1 > (size_t)AIKIT_LINE_QUEUE_MAX_BYTES);
     if (!over) {
@@ -95,7 +111,6 @@ bool AIKitStreamResponse::pushLineBlocking(const String& line) {
         ++_count;
         _bytes_buffered += line.length() + 1;
     }
-    AIKIT_SR_EXIT();
     if (over) setError(AIKIT_ERR_BUFFER_OVERFLOW);
     return !over;
 #endif
@@ -110,18 +125,36 @@ void AIKitStreamResponse::markComplete(int httpStatus, int transportErr) {
 }
 
 bool AIKitStreamResponse::popLine(String& out) {
+#if defined(ESP32)
+    String* p = nullptr;
     AIKIT_SR_ENTER();
     if (_count == 0) {
         AIKIT_SR_EXIT();
         return false;
     }
+    p = _ring[_tail];
+    _ring[_tail] = nullptr;         // 槽位指针出队（锁内仅指针操作）
+    _tail = (_tail + 1) % kRingSlots;
+    --_count;
+    _bytes_buffered -= ((p != nullptr) ? (p->length() + 1) : 1);
+    AIKIT_SR_EXIT();
+    // 拷贝与释放都在锁外（可能触发堆操作）
+    if (p != nullptr) {
+        out = *p;
+        delete p;
+    } else {
+        out = "";
+    }
+    return true;
+#else
+    if (_count == 0) return false;
     out = _ring[_tail];
     _ring[_tail] = String();   // 立即释放该槽堆内存
     _tail = (_tail + 1) % kRingSlots;
     --_count;
     _bytes_buffered -= (out.length() + 1);
-    AIKIT_SR_EXIT();
     return true;
+#endif
 }
 
 bool AIKitStreamResponse::complete() const {
@@ -230,8 +263,23 @@ void AIKitStreamResponse::internalClose(uint32_t waitMs) {
         owner->finishStreamFromResponse(waitMs);
     }
 
-    // 丢弃剩余缓冲，释放内存
+    // 丢弃剩余缓冲，释放内存（堆操作全部在锁外）
+#if defined(ESP32)
+    String* drain[kRingSlots];
+    size_t n = 0;
     AIKIT_SR_ENTER();
+    while (_count > 0) {
+        drain[n++] = _ring[_tail];
+        _ring[_tail] = nullptr;
+        _tail = (_tail + 1) % kRingSlots;
+        --_count;
+    }
+    _bytes_buffered = 0;
+    AIKIT_SR_EXIT();
+    for (size_t i = 0; i < n; i++) {
+        if (drain[i] != nullptr) delete drain[i];
+    }
+#else
     String tmp;
     while (_count > 0) {
         tmp = _ring[_tail];
@@ -240,8 +288,9 @@ void AIKitStreamResponse::internalClose(uint32_t waitMs) {
         --_count;
     }
     _bytes_buffered = 0;
+#endif
+    // _cur 仅消费者访问，无需加锁
     _cur = ""; _cur_pos = 0; _cur_valid = false;
-    AIKIT_SR_EXIT();
 }
 
 // ---------------------------------------------------------------------------

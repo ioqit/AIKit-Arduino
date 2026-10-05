@@ -521,10 +521,12 @@ int AIKitClient::applyHttpConfig(bool stream, AIKitStreamResponse* resp) {
     if (resp != nullptr) {
         // 行模式：请求完成/出错时更新响应对象状态（同步/异步路径均触发）
         _http.onComplete([this](int code) {
+            _parser.finish();          // 冲刷最后一个未换行的残行（异步路径的唯一时机）
             _http_status = code;
             if (_active_resp != nullptr) _active_resp->markComplete(code, 0);
         });
         _http.onError([this](int err) {
+            _parser.finish();
             _transport_err = err;
             if (_active_resp != nullptr) {
                 _active_resp->markComplete(_http.getStatusCode(), err);

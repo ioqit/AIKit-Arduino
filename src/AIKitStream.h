@@ -89,12 +89,15 @@ private:
 #if defined(ESP32)
     portMUX_TYPE _mux = portMUX_INITIALIZER_UNLOCKED;
     static const size_t kRingSlots = (size_t)AIKIT_LINE_RING_SLOTS;
+    // 指针槽位：临界区内仅写入指针，String 的分配/释放都在锁外进行，
+    // 避免在关中断期间触发堆分配（IDF 禁止在临界区内 malloc）
+    String* _ring[kRingSlots] = {};
 #else
     // ESP8266 等平台：请求在 begin 阶段同步执行完，生产者与消费者同上下文，
-    // 无需互斥；槽数更大以缓冲整个（有上限的）响应。
+    // 无需互斥，可直接存 String 值；槽数更大以缓冲整个（有上限的）响应。
     static const size_t kRingSlots = (size_t)AIKIT_LINE_QUEUE_MAX_LINES;
-#endif
     String  _ring[kRingSlots];
+#endif
     size_t  _head = 0;            // 生产者写指针（模 kRingSlots）
     size_t  _tail = 0;            // 消费者读指针（模 kRingSlots）
     size_t  _count = 0;           // 当前缓冲行数
