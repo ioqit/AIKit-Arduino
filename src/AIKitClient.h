@@ -92,7 +92,7 @@ public:
 
     // 自定义根 CA（PEM 文本）。指针须在请求期间保持有效。
     // ESP8266：库会在首次请求时把 PEM 解析为 BearSSL::X509List 并缓存；
- // 若证书存于 PROGMEM，请改用 setCACert_P(PSTR(...))。
+    // 若证书存于 PROGMEM，请改用 setCACert_P(PSTR(...))。
     void setCACert(const char* pem) {
         _ca_cert = pem;
         _ca_valid = (pem != nullptr);

@@ -732,10 +732,17 @@ int AIKitClient::chat(const AIKitMessage* messages, size_t count, AIKitChatResul
     int rc = performChat(messages, count, false, nullptr);
     if (rc != AIKIT_OK) return rc;
     int prc = parseChatResponse(_response_body, result);
-    if (prc != AIKIT_OK && _err_body.length() == 0) {
-        // 解析失败时保留响应体片段，便于排障
-        _err_body = _response_body.substring(0, AIKIT_ERRBODY_MAX);
+    if (prc != AIKIT_OK) {
+        logD("raw body head: %.*s",
+             (int)(_response_body.length() > 256 ? 256 : _response_body.length()),
+             _response_body.c_str());
+        if (_err_body.length() == 0) {
+            // 解析失败时保留响应体片段，便于排障
+            _err_body = _response_body.substring(0, AIKIT_ERRBODY_MAX);
+        }
     }
+    // 及时释放完整响应体（对 ESP8266 的紧张堆更友好）
+    _response_body = "";
     return prc;
 }
 
