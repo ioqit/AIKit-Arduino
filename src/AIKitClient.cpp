@@ -55,6 +55,12 @@ AIKitClient::~AIKitClient() {
         _http.onError(nullptr);
         _http.end();
     }
+#if defined(ESP8266)
+    if (_x509_ta != nullptr) {
+        delete _x509_ta;
+        _x509_ta = nullptr;
+    }
+#endif
 }
 
 bool AIKitClient::begin(AIKitVendor vendor, const char* apiKey) {
@@ -532,15 +538,21 @@ void AIKitClient::applySecureSettings(WiFiClientSecure* sec) {
     if (sec == nullptr) return;
     if (_ca_valid && _ca_cert != nullptr) {
 #if defined(ESP8266)
-        if (_ca_progmem) {
-            sec->setCACert_P(_ca_cert, strlen_P(_ca_cert));
-        } else {
-            sec->setCACert(_ca_cert, strlen(_ca_cert));
+        // BearSSL：PEM → X509List 信任锚（惰性解析一次并缓存；
+        // ESP8266 的 flash 内存映射使 PROGMEM 指针可直接读取）
+        if (_x509_ta == nullptr) {
+            _x509_ta = new (std::nothrow) BearSSL::X509List(_ca_cert);
+            if (_x509_ta == nullptr) {
+                logE("OOM: cannot allocate trust anchor, falling back to strict mode");
+                return;   // 不设置信任锚 → 严格校验下连接将失败（fail-closed）
+            }
         }
+        sec->setTrustAnchors(_x509_ta);
+        logD("TLS: using custom root CA (BearSSL trust anchor)");
 #else
         sec->setCACert(_ca_cert);
-#endif
         logD("TLS: using custom root CA");
+#endif
     } else if (_insecure) {
         sec->setInsecure();
         logD("TLS: insecure mode (validation disabled)");

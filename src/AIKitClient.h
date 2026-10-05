@@ -18,6 +18,9 @@
 
 #include <ArduinoJson.h>
 #include <StreamHTTPClient.h>
+#if defined(ESP8266)
+  #include <BearSSLHelpers.h>   // BearSSL::X509List（根证书信任锚）
+#endif
 
 #include "AIKitConfig.h"
 #include "AIKitTypes.h"
@@ -88,10 +91,23 @@ public:
     bool insecure() const { return _insecure; }
 
     // 自定义根 CA（PEM 文本）。指针须在请求期间保持有效。
-    // ESP8266 若证书存于 PROGMEM，请改用 setCACert_P(PSTR(...))。
-    void setCACert(const char* pem) { _ca_cert = pem; _ca_valid = (pem != nullptr); }
+    // ESP8266：库会在首次请求时把 PEM 解析为 BearSSL::X509List 并缓存；
+ // 若证书存于 PROGMEM，请改用 setCACert_P(PSTR(...))。
+    void setCACert(const char* pem) {
+        _ca_cert = pem;
+        _ca_valid = (pem != nullptr);
 #if defined(ESP8266)
-    void setCACert_P(PGM_P pem) { _ca_cert = pem; _ca_progmem = true; _ca_valid = (pem != nullptr); }
+        _ca_progmem = false;   // 从 PROGMEM 版本切回普通版本时复位标志
+        if (_x509_ta != nullptr) { delete _x509_ta; _x509_ta = nullptr; }
+#endif
+    }
+#if defined(ESP8266)
+    void setCACert_P(PGM_P pem) {
+        _ca_cert = pem;
+        _ca_progmem = true;
+        _ca_valid = (pem != nullptr);
+        if (_x509_ta != nullptr) { delete _x509_ta; _x509_ta = nullptr; }
+    }
 #endif
 
     // -------------------------------------------------------------------
@@ -245,6 +261,7 @@ private:
     bool         _ca_valid = false;
 #if defined(ESP8266)
     bool         _ca_progmem = false;
+    BearSSL::X509List* _x509_ta = nullptr;   // 惰性解析并缓存的信任锚
 #endif
 
     // ---- 自定义请求头 ----

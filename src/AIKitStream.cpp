@@ -7,6 +7,11 @@
 
 #include <ArduinoJson.h>
 
+#if defined(ESP32)
+  #include <freertos/FreeRTOS.h>
+  #include <freertos/task.h>
+#endif
+
 #include "AIKitClient.h"
 
 // ---------------------------------------------------------------------------
