@@ -1,0 +1,23 @@
+# Arduino IDE / arduino-cli 构建产物
+build/
+*.hex
+*.bin
+*.elf
+*.map
+
+# arduino-cli 临时
+.sketchbuild/
+
+# 备份与临时文件
+*~
+*.bak
+*.tmp
+.DS_Store
+
+# 打包产物（发布时另行打包）
+*.zip
+
+# IDE
+.vscode/
+.idea/
+.history/
