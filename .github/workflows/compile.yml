@@ -1,0 +1,98 @@
+# AIKit-Arduino 手动编译矩阵 | Manual compile matrix
+#
+# 仅 workflow_dispatch 手动触发（按需验证，不设任何自动触发）。
+# 矩阵：4 块板 × 全部示例；依赖：ArduinoJson + StreamHTTPClient +
+# ArduinoWebsockets（可选依赖，一并安装以覆盖实时 ASR 示例）。
+#
+# Trigger: manual only (workflow_dispatch). No schedule, no push/PR.
+
+name: Compile Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_esp8266:
+        description: 'Also compile ESP8266 (nodemcuv2)'
+        type: boolean
+        default: true
+
+jobs:
+  compile:
+    name: ${{ matrix.fqbn }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fqbn: 'esp32:esp32:esp32'
+            name: esp32
+          - fqbn: 'esp32:esp32:esp32s3'
+            name: esp32s3
+          - fqbn: 'esp32:esp32:esp32c3'
+            name: esp32c3
+          - fqbn: 'esp8266:esp8266:nodemcuv2'
+            name: nodemcuv2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Skip ESP8266 (optional)
+        if: matrix.name == 'nodemcuv2' && inputs.include_esp8266 == false
+        run: echo "Skipping ESP8266 board" && exit 0
+
+      - name: Setup arduino-cli
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: Install platform cores
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli config add board_manager.additional_urls \
+            https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli core install esp8266:esp8266
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "ArduinoJson" "ArduinoWebsockets"
+          # StreamHTTPClient 不在库管理器索引中，从 GitHub 安装
+          git clone --depth 1 \
+            https://github.com/ioqit/StreamHTTPClient.git \
+            "$HOME/Arduino/libraries/StreamHTTPClient"
+
+      - name: Compile all examples
+        shell: bash
+        run: |
+          LIB="$(pwd)"
+          REPORT=compile_report.txt
+          : > "$REPORT"
+          PASS=0; FAIL=0
+          shopt -s nullglob
+          for dir in "$LIB"/examples/*/; do
+            ex=$(basename "$dir")
+            ino="$dir/$ex.ino"
+            [ -f "$ino" ] || continue
+            if arduino-cli compile --fqbn "${{ matrix.fqbn }}" \
+                 --library "$LIB" "$dir" > "/tmp/$ex.log" 2>&1; then
+              size=$(grep -o 'Sketch uses [0-9]* bytes' "/tmp/$ex.log" | head -1)
+              echo "PASS  ${{ matrix.name }}  $ex  ($size)" >> "$REPORT"
+              PASS=$((PASS+1))
+            else
+              echo "FAIL  ${{ matrix.name }}  $ex" >> "$REPORT"
+              grep -iE 'error:' "/tmp/$ex.log" | head -8 >> "$REPORT"
+              FAIL=$((FAIL+1))
+            fi
+          done
+          cat "$REPORT"
+          echo "summary: PASS=$PASS FAIL=$FAIL board=${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Upload compile report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-report-${{ matrix.name }}
+          path: compile_report.txt
