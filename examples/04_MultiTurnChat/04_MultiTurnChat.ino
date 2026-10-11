@@ -1,14 +1,22 @@
 /*
-  04_MultiTurnChat - 多轮对话
+  04_MultiTurnChat - 多轮对话 | Multi-turn conversation
 
   演示内容：
     - 用 AIKitMessage 数组自管对话历史（user/assistant 交替）
     - system prompt 的两种来源：setSystemPrompt() 或显式传入 system 消息
+  What this demonstrates:
+    - Manage the conversation history yourself with an AIKitMessage array
+      (user/assistant alternating)
+    - Two sources for the system prompt: setSystemPrompt() or an explicitly
+      passed system message
 
   说明：本库不替你保管历史（MCU 内存有限），你可以在循环里把
   上一轮回复 append 到数组，或落盘到 LittleFS/SD。
+  Note: the library does not keep history for you (MCU RAM is limited);
+  you can append the previous reply to the array in a loop, or persist it
+  to LittleFS/SD.
 
-  适用于 ESP32 / ESP8266。
+  适用于 ESP32 / ESP8266 | Works on ESP32 / ESP8266.
 */
 #if defined(ESP8266)
   #include <ESP8266WiFi.h>
@@ -32,11 +40,11 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
   Serial.println("\n[WiFi] connected");
 
-  ai.begin(AIKIT_ZHIPU, API_KEY);          // 例：智谱 GLM（glm-4.7-flash 免费档）
+  ai.begin(AIKIT_ZHIPU, API_KEY);          // 例：智谱 GLM（glm-4.7-flash 免费档） | e.g. Zhipu GLM (glm-4.7-flash free tier)
   ai.setSystemPrompt("你是一个细心的对话助手，回答保持简洁。");
 
-  // ---- 第一轮：静态历史 ----
-  // 注意：AIKitMessage 只保存指针，传入的 String 须在 chat() 返回前保持有效
+  // ---- 第一轮：静态历史 ---- | Round 1: static history
+  // 注意：AIKitMessage 只保存指针，传入的 String 须在 chat() 返回前保持有效 | Note: AIKitMessage stores pointers only; the Strings you pass must stay valid until chat() returns
   AIKitMessage history[] = {
     { "user",      "我最喜欢的开发板是 ESP32。" },
     { "assistant", "记住了！ESP32 双核 240MHz，带 WiFi 和蓝牙，做 IoT 很合适。" },
@@ -51,13 +59,13 @@ void setup() {
   }
   Serial.println("[Round 1] " + round1Reply);
 
-  // ---- 第二轮：把第一轮回复追加进历史（String 生命周期在本次作用域内）----
+  // ---- 第二轮：把第一轮回复追加进历史（String 生命周期在本次作用域内）---- | Round 2: append the round-1 reply into history (String lifetime is within this scope)
   String userMsg2 = "再给两个英文名备选。";
   AIKitMessage turns[] = {
     history[0],
     history[1],
     history[2],
-    { "assistant", round1Reply.c_str() },   // 第一轮的回复进入历史
+    { "assistant", round1Reply.c_str() },   // 第一轮的回复进入历史 | the round-1 reply joins the history
     { "user",      userMsg2.c_str() },
   };
 
