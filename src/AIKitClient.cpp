@@ -26,6 +26,13 @@ const char* aikitErrorToString(int err) {
         case AIKIT_ERR_BUFFER_OVERFLOW: return "line buffer overflow";
         case AIKIT_ERR_STREAM_CLOSED:   return "stream closed";
         case AIKIT_ERR_NOT_SUPPORTED:   return "not supported";
+        case AIKIT_ERR_ASR_AUDIO:       return "invalid audio data/format";
+        case AIKIT_ERR_ASR_PROTOCOL:    return "ASR response protocol error";
+        case AIKIT_ERR_WS:              return "websocket connect/communication failed";
+        case AIKIT_ERR_NOT_CONNECTED:   return "websocket not connected";
+        case AIKIT_ERR_INFLATE:         return "gzip inflate failed";
+        case AIKIT_ERR_HISTORY_LIMIT:   return "history capacity limit reached";
+        case AIKIT_ERR_PAYLOAD_TOO_BIG: return "request body too large for this platform";
         default:                        return "unknown error";
     }
 }
@@ -64,14 +71,19 @@ AIKitClient::~AIKitClient() {
 }
 
 bool AIKitClient::begin(AIKitVendor vendor, const char* apiKey) {
-    if (apiKey == nullptr || apiKey[0] == '\0') {
-        logE("API key is empty");
-        return false;
-    }
     const AIKitVendorInfo* v = aikitVendorInfo((uint8_t)vendor);
     if (v == nullptr) {
         logE("unknown vendor id %u", (unsigned)vendor);
         return false;
+    }
+    // v1.2.0：本地部署厂商（llama.cpp / Ollama / vLLM / LM Studio）无鉴权，
+    // 允许空 API Key；其余厂商仍然必填
+    if (!v->noAuth && (apiKey == nullptr || apiKey[0] == '\0')) {
+        logE("API key is empty");
+        return false;
+    }
+    if (v->noAuth && (apiKey == nullptr || apiKey[0] == '\0')) {
+        logI("local vendor without auth (no API key required)");
     }
     if (_stream_active) {
         logW("switching vendor while a stream is active, closing it");
@@ -80,11 +92,12 @@ bool AIKitClient::begin(AIKitVendor vendor, const char* apiKey) {
 
     bool vendorChanged = (_vendor_id != (uint8_t)vendor);
     _vendor_id = (uint8_t)vendor;
+    _no_auth = v->noAuth;
     _host = v->host;
     _port = v->port;
     _path = v->path;
     _https = v->https;
-    _api_key = apiKey;
+    _api_key = (apiKey != nullptr) ? apiKey : "";
     if (vendorChanged || !_model_user_set || _model.isEmpty()) {
         _model = v->defaultModel;
         _model_user_set = false;
@@ -165,7 +178,7 @@ void AIKitClient::end() {
 }
 
 bool AIKitClient::isReady() const {
-    return _api_key.length() > 0 && _host.length() > 0 &&
+    return (_no_auth || _api_key.length() > 0) && _host.length() > 0 &&
            _path.length() > 0 && _model.length() > 0;
 }
 
@@ -431,7 +444,15 @@ int AIKitClient::buildRequestBody(const AIKitMessage* messages, size_t count,
     if (_has_max_tokens)      doc["max_tokens"] = _max_tokens;
     if (_has_max_completion_tokens)
         doc["max_completion_tokens"] = _max_completion_tokens;
-    if (stream)               doc["stream"] = true;
+    if (stream) {
+        doc["stream"] = true;
+        // v1.2.0：请求流式 usage（末尾 chunk 携带 usage 字段）。
+        // 主流 OpenAI 兼容厂商均支持；若个别厂商拒收（400 且错误体提到
+        // stream_options / include_usage），重试管线会自动降级重发。
+        if (_include_usage) {
+            doc["stream_options"]["include_usage"] = true;
+        }
+    }
 
     // 自定义 JSON 字段：覆盖 / 追加
     for (size_t i = 0; i < _field_count; i++) {
@@ -484,9 +505,11 @@ int AIKitClient::applyHttpConfig(bool stream, AIKitStreamResponse* resp) {
     _http.setTcpTimeout(_tcp_timeout_ms);
     _http.setFollowRedirects(SHC_REDIRECT_OFF);   // JSON API 不跟随重定向
 
-    String auth = "Bearer ";
-    auth += _api_key;
-    _http.setAuthorization(auth);
+    if (_api_key.length() > 0) {
+        String auth = "Bearer ";
+        auth += _api_key;
+        _http.setAuthorization(auth);
+    }   // v1.2.0：无鉴权本地端点不发 Authorization 头
 
     _http.addHeader("Content-Type", "application/json");
     if (stream) {
@@ -578,6 +601,7 @@ void AIKitClient::resetRequestState() {
     _response_body = "";
     _finish_reason = "";
     _usage = AIKitUsage();
+    _stream_got_delta = false;
 }
 
 void AIKitClient::cleanupFailedRequest() {
@@ -729,7 +753,7 @@ int AIKitClient::chat(const AIKitMessage* messages, size_t count, String& outCon
 }
 
 int AIKitClient::chat(const AIKitMessage* messages, size_t count, AIKitChatResult& result) {
-    int rc = performChat(messages, count, false, nullptr);
+    int rc = performChatWithRetry(messages, count, false, nullptr);
     if (rc != AIKIT_OK) return rc;
     int prc = parseChatResponse(_response_body, result);
     if (prc != AIKIT_OK) {
@@ -787,7 +811,147 @@ int AIKitClient::parseChatResponse(const String& body, AIKitChatResult& result) 
     }
     _finish_reason = result.finishReason;
     _usage = result.usage;
+    noteUsage(_usage);
     return AIKIT_OK;
+}
+
+// ===========================================================================
+// v1.2.0：重试 / 用量统计 / 历史集成
+// ===========================================================================
+
+void AIKitClient::setRetry(uint8_t maxRetries, uint32_t baseDelayMs,
+                           uint32_t maxDelayMs) {
+    _retry_max = maxRetries;
+    _retry_base_ms = baseDelayMs;
+    _retry_cap_ms = maxDelayMs;
+}
+
+AIKitUsage AIKitClient::totalUsage() const {
+    AIKitUsage u;
+    if (_total_total > 0) {
+        u.promptTokens = _total_prompt;
+        u.completionTokens = _total_completion;
+        u.totalTokens = _total_total;
+    }
+    return u;
+}
+
+void AIKitClient::resetTotalUsage() {
+    _total_prompt = 0;
+    _total_completion = 0;
+    _total_total = 0;
+}
+
+void AIKitClient::noteUsage(const AIKitUsage& u) {
+    if (u.promptTokens > 0)     _total_prompt += u.promptTokens;
+    if (u.completionTokens > 0) _total_completion += u.completionTokens;
+    if (u.totalTokens > 0)      _total_total += u.totalTokens;
+}
+
+bool AIKitClient::shouldRetry(int rc) const {
+    if (!_retry_enabled || _retry_max == 0) return false;
+    if (rc == AIKIT_ERR_CONNECT || rc == AIKIT_ERR_TIMEOUT) return true;
+    if (rc == AIKIT_ERR_HTTP_STATUS) {
+        int s = _http_status;
+        if (s == 429 || s == 500 || s == 502 || s == 503 || s == 504) return true;
+        // include_usage 降级重发：个别厂商对 stream_options 报 400
+        if (s == 400 && (_err_body.indexOf("stream_options") >= 0 ||
+                         _err_body.indexOf("include_usage") >= 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int AIKitClient::performChatWithRetry(const AIKitMessage* messages, size_t count,
+                                      bool stream, AIKitStreamResponse* resp) {
+    // 逐行读模式不自动重试：已入队的行无法撤销（文档说明）
+    if (resp != nullptr) {
+        return performChat(messages, count, stream, resp);
+    }
+    int rc = performChat(messages, count, stream, nullptr);
+    uint8_t attempt = 0;
+    while (rc != AIKIT_OK && attempt < _retry_max && shouldRetry(rc)) {
+        // 流式已输出增量 → 不再重试（避免重复输出）
+        if (stream && _stream_got_delta) {
+            logW("stream already emitted deltas, skip retry");
+            break;
+        }
+        // 400 + stream_options 拒收 → 关闭 include_usage 再试
+        if (rc == AIKIT_ERR_HTTP_STATUS && _http_status == 400 && _include_usage) {
+            logW("vendor rejected stream_options.include_usage, disable and retry");
+            _include_usage = false;
+        }
+        uint32_t wait = _retry_base_ms << attempt;   // 指数退避
+        if (wait > _retry_cap_ms || wait == 0) wait = _retry_cap_ms;
+        logW("retry %u/%u after %ums (last error: %s)",
+             (unsigned)(attempt + 1), (unsigned)_retry_max,
+             (unsigned)wait, aikitErrorToString(rc));
+        if (_on_retry) _on_retry(attempt + 1, rc);
+        delay(wait);
+        attempt++;
+        rc = performChat(messages, count, stream, nullptr);
+    }
+    return rc;
+}
+
+// ---- 历史集成重载 ----
+
+int AIKitClient::chat(AIKitHistory& history, const char* userText,
+                       String& outContent) {
+    outContent = "";
+    AIKitChatResult result;
+    int rc = chat(history, userText, result);
+    outContent = result.content;
+    return rc;
+}
+
+int AIKitClient::chat(AIKitHistory& history, const String& userText,
+                       String& outContent) {
+    return chat(history, userText.c_str(), outContent);
+}
+
+int AIKitClient::chat(AIKitHistory& history, const char* userText,
+                       AIKitChatResult& result) {
+    if (userText == nullptr) return AIKIT_ERR_NULL_ARG;
+    int rc = history.appendUser(userText);
+    if (rc != AIKIT_OK) {
+        logE("history append failed: %s", aikitErrorToString(rc));
+        return rc;
+    }
+    rc = chat(history.messages(), history.size(), result);
+    if (rc == AIKIT_OK) {
+        int hrc = history.appendAssistant(result.content);
+        if (hrc != AIKIT_OK) {
+            // 对话本身成功，仅历史入栈失败（可能触容量上限）：告警不报错
+            logW("history append failed: %s", aikitErrorToString(hrc));
+        }
+    } else {
+        history.popBack();   // 失败回滚本次 user 消息，保持历史一致
+    }
+    return rc;
+}
+
+int AIKitClient::chat(AIKitHistory& history, const String& userText,
+                       AIKitChatResult& result) {
+    return chat(history, userText.c_str(), result);
+}
+
+int AIKitClient::chatStream(AIKitHistory& history, const char* userText) {
+    if (userText == nullptr) return AIKIT_ERR_NULL_ARG;
+    int rc = history.appendUser(userText);
+    if (rc != AIKIT_OK) {
+        logE("history append failed: %s", aikitErrorToString(rc));
+        return rc;
+    }
+    rc = chatStream(history.messages(), history.size());
+    if (rc != AIKIT_OK) history.popBack();
+    // 成功后：完整正文请在 onDelta 中拼接后 history.appendAssistant(...) 入史
+    return rc;
+}
+
+int AIKitClient::chatStream(AIKitHistory& history, const String& userText) {
+    return chatStream(history, userText.c_str());
 }
 
 // ===========================================================================
@@ -805,7 +969,7 @@ int AIKitClient::chatStream(const String& userText) {
 }
 
 int AIKitClient::chatStream(const AIKitMessage* messages, size_t count) {
-    int rc = performChat(messages, count, true, nullptr);
+    int rc = performChatWithRetry(messages, count, true, nullptr);
     if (rc == AIKIT_OK && _sse_err != AIKIT_OK) rc = _sse_err;
     if (rc == AIKIT_OK && _parse_skips > 0) {
         logW("%u chunks could not be parsed and were skipped", (unsigned)_parse_skips);
@@ -843,10 +1007,12 @@ void AIKitClient::handleChatChunk(JsonVariantConst root) {
         if (!delta.isNull()) {
             const char* reasoning = delta["reasoning_content"].as<const char*>();
             if (reasoning != nullptr && _on_reasoning_delta) {
+                _stream_got_delta = true;
                 _on_reasoning_delta(reasoning, strlen(reasoning));
             }
             const char* content = delta["content"].as<const char*>();
             if (content != nullptr && _on_delta) {
+                _stream_got_delta = true;
                 _on_delta(content, strlen(content));
             }
         }
@@ -858,6 +1024,7 @@ void AIKitClient::handleChatChunk(JsonVariantConst root) {
         _usage.promptTokens = usage["prompt_tokens"] | -1;
         _usage.completionTokens = usage["completion_tokens"] | -1;
         _usage.totalTokens = usage["total_tokens"] | -1;
+        noteUsage(_usage);
     }
 }
 

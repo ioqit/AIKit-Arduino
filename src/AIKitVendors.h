@@ -1,10 +1,12 @@
 /*
  * AIKitVendors.h - 内置厂商预设表
  *
- * 所有端点均依据各厂商官方文档核实（2026-10），详见 README《厂商 API 规格表》。
- * 所有预设均为 HTTPS + Bearer 鉴权的 OpenAI 兼容 chat completions 端点。
+ * 所有端点均依据各厂商官方文档核实（2026-10），详见 docs/02_vendors.md。
+ * chat completions 预设均为 OpenAI 兼容端点；本地部署厂商（llama.cpp /
+ * Ollama / vLLM / LM Studio）无需 API Key，且请用 setModel() 指定服务端
+ * 实际加载的模型名。
  *
- * AIKit-Arduino (https://github.com/ioqite/AIKit-Arduino)
+ * AIKit-Arduino (https://github.com/ioqit/AIKit-Arduino)
  */
 #pragma once
 
@@ -26,7 +28,16 @@ enum AIKitVendor : uint8_t {
     AIKIT_MINIMAX            = 8,   // MiniMax（国内）
     AIKIT_MINIMAX_INTL       = 9,   // MiniMax（国际）
     AIKIT_OPENAI             = 10,  // OpenAI
-    AIKIT_VENDOR_COUNT       = 11,
+    // ---- v1.2.0 新增 ----
+    AIKIT_GROQ               = 11,  // Groq（超低延迟 LPU 推理）
+    AIKIT_OPENROUTER         = 12,  // OpenRouter（聚合网关，数百模型）
+    AIKIT_MISTRAL            = 13,  // Mistral AI（国际）
+    AIKIT_LLAMACPP           = 14,  // llama.cpp llama-server（本地部署，无鉴权）
+    AIKIT_OLLAMA             = 15,  // Ollama（本地部署，无鉴权）
+    AIKIT_VLLM               = 16,  // vLLM（本地部署，无鉴权）
+    AIKIT_LMSTUDIO           = 17,  // LM Studio（本地部署，无鉴权）
+    AIKIT_MODELSCOPE         = 18,  // 魔搭社区 ModelScope API-Inference（国内）
+    AIKIT_VENDOR_COUNT       = 19,
     AIKIT_CUSTOM             = 0xFF // beginCustom() 自定义端点
 };
 
@@ -36,10 +47,11 @@ enum AIKitVendor : uint8_t {
 struct AIKitVendorInfo {
     const char* vendorName;   // 展示名，如 "DeepSeek"
     const char* host;         // API 主机名
-    uint16_t    port;         // 端口（443）
+    uint16_t    port;         // 端口（https=443 / http=80 / 本地服务为各自默认端口）
     const char* path;         // chat completions 路径
     const char* defaultModel; // 推荐默认模型（可 setModel() 更换）
     bool        https;        // 是否 HTTPS
+    bool        noAuth;       // true：本地部署无鉴权（begin() 允许空 API Key）
 };
 
 // 取厂商预设信息；id 越界返回 nullptr（调用方负责判空，不抛异常）

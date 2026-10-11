@@ -26,6 +26,7 @@
 #include "AIKitTypes.h"
 #include "AIKitVendors.h"
 #include "AIKitStream.h"
+#include "AIKitHistory.h"
 
 class AIKitClient {
 public:
@@ -150,6 +151,51 @@ public:
     AIKitLogLevel logLevel() const { return _log_level; }
 
     // -------------------------------------------------------------------
+    // v1.2.0：Token 用量统计
+    // -------------------------------------------------------------------
+    // 流式请求是否附带 stream_options.include_usage（默认 true；主流
+    // OpenAI 兼容厂商均支持。若厂商拒收会 400，库会自动降级重发一次）。
+    void setIncludeUsage(bool yes) { _include_usage = yes; }
+    bool includeUsage() const { return _include_usage; }
+
+    // 本客户端生命周期内的累计用量（跨请求求和）
+    AIKitUsage totalUsage() const;
+    void resetTotalUsage();
+
+    // -------------------------------------------------------------------
+    // v1.2.0：失败自动重试（可配置次数与退避）
+    // -------------------------------------------------------------------
+    // 触发条件：连接/传输失败、超时、HTTP 429/5xx；以及因
+    // stream_options.include_usage 被 400 拒绝时的自动降级重发。
+    // 已收到流式增量的请求不会重试（避免重复输出）；
+    // 逐行读模式（chatStreamTo）不自动重试（已入队的行无法撤销）。
+    // 退避：第 n 次重试前等待 base << n 毫秒，封顶 maxDelayMs。
+    void setRetry(uint8_t maxRetries,
+                  uint32_t baseDelayMs = AIKIT_RETRY_BASE_DELAY_MS,
+                  uint32_t maxDelayMs = AIKIT_RETRY_MAX_DELAY_MS);
+    void setRetryEnabled(bool yes) { _retry_enabled = yes; }
+    bool retryEnabled() const { return _retry_enabled; }
+    uint8_t retryCount() const { return _retry_max; }
+    // 重试即将发生时触发（attempt 从 1 起；lastErr 为上一次错误码）
+    void onRetry(std::function<void(uint8_t attempt, int lastErr)> cb) {
+        _on_retry = cb;
+    }
+
+    // -------------------------------------------------------------------
+    // v1.2.0：对话历史管理（配合 AIKitHistory）
+    // -------------------------------------------------------------------
+    // 自动历史：把 userText 追加进 history → 以全部历史请求 →
+    // 成功后把回复追加进 history（失败则回滚 user 消息）。
+    int chat(AIKitHistory& history, const char* userText, String& outContent);
+    int chat(AIKitHistory& history, const String& userText, String& outContent);
+    int chat(AIKitHistory& history, const char* userText, AIKitChatResult& result);
+    int chat(AIKitHistory& history, const String& userText, AIKitChatResult& result);
+    // 流式自动历史：user 入史 → 流式请求；回复正文请自行在 onDelta 中拼接后
+    // appendAssistant()（无法在库内自动获取完整正文）
+    int chatStream(AIKitHistory& history, const char* userText);
+    int chatStream(AIKitHistory& history, const String& userText);
+
+    // -------------------------------------------------------------------
     // 非流式对话（阻塞直至响应完成）
     // -------------------------------------------------------------------
     // 最简：单条用户消息 → 回复正文
@@ -210,6 +256,10 @@ private:
     // ---- 内部：请求管线 ----
     int  performChat(const AIKitMessage* messages, size_t count,
                      bool stream, AIKitStreamResponse* resp);
+    int  performChatWithRetry(const AIKitMessage* messages, size_t count,
+                              bool stream, AIKitStreamResponse* resp);
+    bool shouldRetry(int rc) const;
+    void noteUsage(const AIKitUsage& u);
     int  buildRequestBody(const AIKitMessage* messages, size_t count,
                           bool stream, String& outBody);
     int  applyHttpConfig(bool stream, AIKitStreamResponse* resp);
@@ -277,6 +327,19 @@ private:
     // ---- 回调 ----
     std::function<void(const char*, size_t)> _on_delta;
     std::function<void(const char*, size_t)> _on_reasoning_delta;
+    std::function<void(uint8_t, int)> _on_retry;
+
+    // ---- v1.2.0：重试 / 用量统计 ----
+    bool     _retry_enabled = true;
+    uint8_t  _retry_max = AIKIT_DEFAULT_MAX_RETRIES;
+    uint32_t _retry_base_ms = AIKIT_RETRY_BASE_DELAY_MS;
+    uint32_t _retry_cap_ms = AIKIT_RETRY_MAX_DELAY_MS;
+    bool     _include_usage = true;
+    bool     _stream_got_delta = false;   // 流式重试闸门：已出增量则不重试
+    int32_t  _total_prompt = 0;
+    int32_t  _total_completion = 0;
+    int32_t  _total_total = 0;
+    bool     _no_auth = false;            // 本地部署厂商：无鉴权
 
     // ---- 每请求状态 ----
     AIKitSSEParser        _parser;

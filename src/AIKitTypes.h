@@ -33,6 +33,14 @@ enum AIKitError : int {
     AIKIT_ERR_BUFFER_OVERFLOW = -112,  // 逐行读缓冲溢出（详见 README 平台差异）
     AIKIT_ERR_STREAM_CLOSED   = -113,  // 流已关闭
     AIKIT_ERR_NOT_SUPPORTED   = -114,  // 当前平台或配置不支持该操作
+    // ---- v1.2.0：ASR（语音转文字）与历史管理 ----
+    AIKIT_ERR_ASR_AUDIO       = -115,  // 音频数据为空 / 格式或参数不被该厂商接受
+    AIKIT_ERR_ASR_PROTOCOL    = -116,  // ASR 响应协议解析失败（结构不符预期）
+    AIKIT_ERR_WS              = -117,  // WebSocket 连接 / 握手 / 通信失败
+    AIKIT_ERR_NOT_CONNECTED   = -118,  // WebSocket 未连接（先 connect()）
+    AIKIT_ERR_INFLATE         = -119,  // gzip 响应解压失败（火山引擎二进制协议）
+    AIKIT_ERR_HISTORY_LIMIT   = -120,  // 对话历史超出容量上限（见 AIKitConfig.h）
+    AIKIT_ERR_PAYLOAD_TOO_BIG = -121,  // 音频/请求体超出当前平台的可发送上限
 };
 
 // 返回可读的错误描述（静态字符串，不分配内存）
